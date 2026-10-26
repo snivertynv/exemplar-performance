@@ -81,6 +81,7 @@ pub struct AtifProfileConfig {
     pub pacing: String,
     pub timeout_sec: Option<f64>,
     pub capture_action_outputs: bool,
+    pub continue_after_recorded_timeout: bool,
     pub prepare_command: Option<String>,
     pub verification_command: Option<String>,
     pub controller_runtime: String,
@@ -264,6 +265,7 @@ struct ParsedArguments {
     pacing: String,
     timeout_sec: Option<f64>,
     capture_action_outputs: bool,
+    continue_after_recorded_timeout: bool,
     prepare_command: Option<String>,
     verification_command: Option<String>,
     controller_runtime: String,
@@ -452,6 +454,10 @@ pub fn parse_arguments(
             "--capture-action-outputs" => {
                 flag(attached)?;
                 parsed.capture_action_outputs = true;
+            }
+            "--continue-after-recorded-timeout" => {
+                flag(attached)?;
+                parsed.continue_after_recorded_timeout = true;
             }
             "--prepare-command" => parsed.prepare_command = Some(take()?),
             "--verification-command" => parsed.verification_command = Some(take()?),
@@ -934,6 +940,7 @@ fn validate_arguments(mut parsed: ParsedArguments) -> Result<AtifProfileConfig, 
         pacing: parsed.pacing,
         timeout_sec,
         capture_action_outputs: parsed.capture_action_outputs,
+        continue_after_recorded_timeout: parsed.continue_after_recorded_timeout,
         prepare_command: parsed.prepare_command,
         verification_command: parsed.verification_command,
         controller_runtime: parsed.controller_runtime,
@@ -1183,6 +1190,9 @@ fn current_replay_command(
     if let Some(timeout) = config.timeout_sec {
         command.extend(["--timeout-sec".to_owned(), python_float(timeout)]);
     }
+    if config.continue_after_recorded_timeout {
+        command.push("--continue-after-recorded-timeout".to_owned());
+    }
     for root in &config.patch_roots {
         command.extend(["--patch-root".to_owned(), root.clone()]);
     }
@@ -1268,6 +1278,9 @@ fn build_container_plan_with_controller(
     }
     if let Some(timeout) = config.timeout_sec {
         command.extend(["--timeout-sec".to_owned(), python_float(timeout)]);
+    }
+    if config.continue_after_recorded_timeout {
+        command.push("--continue-after-recorded-timeout".to_owned());
     }
     for root in &config.patch_roots {
         command.extend(["--patch-root".to_owned(), root.clone()]);
@@ -1502,6 +1515,10 @@ pub fn compose_pipeline_report(
         json!(config.hide_prepared_python3),
     );
     report.insert("patch_roots".to_owned(), json!(config.patch_roots));
+    report.insert(
+        "continue_after_recorded_timeout".to_owned(),
+        json!(config.continue_after_recorded_timeout),
+    );
     report.insert("network".to_owned(), json!(config.legacy_network));
     report.insert(
         "action_output_capture".to_owned(),
@@ -1930,6 +1947,7 @@ fn adapter_report_fields(
         "controller_identity": controller_identity,
         "hide_prepared_python3": config.hide_prepared_python3,
         "patch_roots": config.patch_roots,
+        "continue_after_recorded_timeout": config.continue_after_recorded_timeout,
         "network": config.legacy_network,
         "action_output_capture": {
             "enabled": config.capture_action_outputs,

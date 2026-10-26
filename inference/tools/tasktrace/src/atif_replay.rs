@@ -267,6 +267,10 @@ pub struct ReplayOptions {
     pub artifacts_dir: Option<PathBuf>,
     pub action_output_dir: Option<PathBuf>,
     pub patch_roots: Vec<PathBuf>,
+    /// Keep replaying after an action times out when the source action also timed out, as the
+    /// source agent did. Processes that survive SIGKILL (for example blocked on a FUSE mount) are
+    /// then left behind and reported instead of failing the replay.
+    pub continue_after_recorded_timeout: bool,
 }
 
 impl ReplayOptions {
@@ -278,6 +282,7 @@ impl ReplayOptions {
             artifacts_dir: None,
             action_output_dir: None,
             patch_roots: Vec::new(),
+            continue_after_recorded_timeout: false,
         }
     }
 }
@@ -5120,6 +5125,16 @@ impl ProcessTreeTracker {
         Ok(())
     }
 
+    fn live_pids(&self) -> io::Result<Vec<i32>> {
+        let mut pids = Vec::new();
+        for (pid, process) in &self.processes {
+            if !pidfd_has_exited(&process.pidfd)? {
+                pids.push(*pid);
+            }
+        }
+        Ok(pids)
+    }
+
     fn all_exited(&self) -> io::Result<bool> {
         for process in self.processes.values() {
             if !pidfd_has_exited(&process.pidfd)? {
@@ -5202,7 +5217,8 @@ fn wait_for_child_and_containment(
 fn terminate_and_wait_for_containment(
     child: &mut Child,
     status: Option<ExitStatus>,
-) -> io::Result<ExitStatus> {
+    abandon_unkillable: bool,
+) -> io::Result<(ExitStatus, Vec<i32>)> {
     let root_pid = i32::try_from(child.id()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -5220,14 +5236,15 @@ fn terminate_and_wait_for_containment(
             leader_reaped: true,
         }
     };
-    terminate_tracked_processes(child, status, &mut tracker)
+    terminate_tracked_processes(child, status, &mut tracker, abandon_unkillable)
 }
 
 fn terminate_tracked_processes(
     child: &mut Child,
     mut status: Option<ExitStatus>,
     tracker: &mut ProcessTreeTracker,
-) -> io::Result<ExitStatus> {
+    abandon_unkillable: bool,
+) -> io::Result<(ExitStatus, Vec<i32>)> {
     signal_contained_processes(child, status.is_none(), tracker, libc::SIGTERM)?;
     if wait_for_child_and_containment(
         child,
@@ -5236,7 +5253,7 @@ fn terminate_tracked_processes(
         libc::SIGTERM,
         TIMEOUT_TERMINATION_GRACE,
     )? {
-        return Ok(status.expect("settled child has an exit status"));
+        return Ok((status.expect("settled child has an exit status"), Vec::new()));
     }
     tracker.refresh()?;
     signal_contained_processes(child, status.is_none(), tracker, libc::SIGKILL)?;
@@ -5247,12 +5264,21 @@ fn terminate_tracked_processes(
         libc::SIGKILL,
         TIMEOUT_KILL_SETTLE,
     )? {
+        if abandon_unkillable {
+            // SIGKILL is pending on processes the kernel will not deliver it to yet (uninterruptible
+            // sleep). Leave them; the caller records their PIDs with the action.
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            let status = status.unwrap_or_else(|| ExitStatus::from_raw(libc::SIGKILL));
+            return Ok((status, tracker.live_pids()?));
+        }
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "timed-out subprocess containment remained populated after SIGKILL",
         ));
     }
-    Ok(status.expect("settled child has an exit status"))
+    Ok((status.expect("settled child has an exit status"), Vec::new()))
 }
 
 /// Timeout cleanup combines the original process group with a /proc ancestry
@@ -5268,11 +5294,13 @@ fn terminate_tracked_processes(
 fn wait_with_timeout_cleanup(
     child: &mut Child,
     timeout: Option<Duration>,
-) -> io::Result<(ExitStatus, bool)> {
+    abandon_unkillable: bool,
+) -> io::Result<(ExitStatus, bool, Vec<i32>)> {
     if let Some(status) = wait_without_kill(child, timeout, None)? {
-        return Ok((status, false));
+        return Ok((status, false, Vec::new()));
     }
-    Ok((terminate_and_wait_for_containment(child, None)?, true))
+    let (status, abandoned) = terminate_and_wait_for_containment(child, None, abandon_unkillable)?;
+    Ok((status, true, abandoned))
 }
 
 #[derive(Debug)]
@@ -5282,6 +5310,7 @@ struct CapturedOutput {
     stdout: String,
     stderr: String,
     timed_out: bool,
+    abandoned_pids: Vec<i32>,
 }
 
 struct CapturedCommand<'a> {
@@ -5294,6 +5323,7 @@ struct CapturedCommand<'a> {
     tty: bool,
     artifacts_dir: &'a Path,
     action_index: usize,
+    abandon_unkillable: bool,
 }
 
 fn run_captured_command(request: CapturedCommand<'_>) -> Result<CapturedOutput, ReplayError> {
@@ -5307,6 +5337,7 @@ fn run_captured_command(request: CapturedCommand<'_>) -> Result<CapturedOutput, 
         tty,
         artifacts_dir,
         action_index,
+        abandon_unkillable,
     } = request;
     let mut command = Command::new(shell);
     command.arg(shell_flag).arg(command_text).current_dir(cwd);
@@ -5356,7 +5387,8 @@ fn run_captured_command(request: CapturedCommand<'_>) -> Result<CapturedOutput, 
     let mut child = command.spawn()?;
     drop(command); // Close the parent's slave descriptors so terminal EOF works.
     let process_root_pid = child.id();
-    let (status, timed_out) = wait_with_timeout_cleanup(&mut child, timeout)?;
+    let (status, timed_out, abandoned_pids) =
+        wait_with_timeout_cleanup(&mut child, timeout, abandon_unkillable)?;
     if let Some(terminal) = terminal.as_mut() {
         terminal.finish()?;
     }
@@ -5377,6 +5409,7 @@ fn run_captured_command(request: CapturedCommand<'_>) -> Result<CapturedOutput, 
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
+        abandoned_pids,
     })
 }
 
@@ -5570,7 +5603,7 @@ impl RunningSession {
 fn terminate_session(session: &mut RunningSession) -> io::Result<()> {
     let status = session.poll()?;
     if status.is_none() || !session.tracker.all_exited()? {
-        terminate_tracked_processes(&mut session.child, status, &mut session.tracker)?;
+        terminate_tracked_processes(&mut session.child, status, &mut session.tracker, false)?;
     }
     session.child.stdin.take();
     if let Some(terminal) = session.terminal.as_mut() {
@@ -5753,6 +5786,7 @@ fn execute_command(
     sessions: &mut HashMap<String, RunningSession>,
     artifacts_dir: &Path,
     action_output_dir: Option<&Path>,
+    abandon_unkillable: bool,
 ) -> Result<Map<String, Value>, ReplayError> {
     let command_text = action
         .arguments
@@ -5920,6 +5954,7 @@ fn execute_command(
         tty,
         artifacts_dir,
         action_index: action.index,
+        abandon_unkillable,
     })?;
     let mut result = Map::new();
     insert(&mut result, "command", command_text.to_owned());
@@ -5953,6 +5988,13 @@ fn execute_command(
     }
     if output.timed_out {
         insert(&mut result, "status", "timed_out");
+        if !output.abandoned_pids.is_empty() {
+            insert(
+                &mut result,
+                "unkillable_pids_abandoned",
+                Value::Array(output.abandoned_pids.iter().map(|pid| Value::from(*pid)).collect()),
+            );
+        }
     } else {
         insert(
             &mut result,
@@ -6842,6 +6884,7 @@ pub fn replay_trajectory(
                     &mut sessions,
                     &artifacts_dir,
                     options.action_output_dir.as_deref(),
+                    options.continue_after_recorded_timeout && expected.status == "timed_out",
                 )?;
                 if expected.status == "running" {
                     if let Some(session_id) = expected.session_id.as_ref() {
@@ -6996,7 +7039,7 @@ pub fn replay_trajectory(
             }
             let timed_out = actual_status == "timed_out";
             results.push(result);
-            if timed_out {
+            if timed_out && !(options.continue_after_recorded_timeout && expected.status == "timed_out") {
                 aborted_after_timeout_action_index = Some(action.index);
                 break;
             }
@@ -7202,6 +7245,7 @@ pub fn replay_trajectory(
         "source_trial": trajectory.trial_name(),
         "pacing": options.pacing.as_str(),
         "action_timeout_sec": options.timeout_sec,
+        "continue_after_recorded_timeout": options.continue_after_recorded_timeout,
         "path_policy": {
             "workspace_root": path_policy.workspace_root,
             "readable_roots": path_policy.readable_roots,
@@ -7230,6 +7274,7 @@ struct CliOptions {
     pacing: Pacing,
     timeout_sec: Option<f64>,
     action_output_dir: Option<PathBuf>,
+    continue_after_recorded_timeout: bool,
 }
 
 fn print_cli_help(public_program: &str) {
@@ -7239,6 +7284,7 @@ fn print_cli_help(public_program: &str) {
          \x20      [--pacing {{recorded,unpaced,llm-gaps}}]\n\
          \x20      [--timeout-sec TIMEOUT_SEC]\n\
          \x20      [--action-output-dir ACTION_OUTPUT_DIR]\n\
+         \x20      [--continue-after-recorded-timeout]\n\
          \x20      trajectory"
     );
     println!();
@@ -7258,6 +7304,9 @@ fn print_cli_help(public_program: &str) {
     println!("                        Per-command/session completion timeout.");
     println!("  --action-output-dir ACTION_OUTPUT_DIR");
     println!("                        Optional directory for full source-equivalent action output artifacts.");
+    println!("  --continue-after-recorded-timeout");
+    println!("                        Keep replaying after an action that timed out in the source too; leave");
+    println!("                        processes that survive SIGKILL behind and report their PIDs.");
 }
 
 fn cli_error(public_program: &str, message: impl fmt::Display) -> i32 {
@@ -7302,6 +7351,7 @@ fn parse_cli(arguments: &[OsString]) -> Result<Option<CliOptions>, String> {
     let mut pacing = Pacing::Recorded;
     let mut timeout_sec = None;
     let mut action_output_dir = None;
+    let mut continue_after_recorded_timeout = false;
     let mut positional_only = false;
     let mut index = 0;
     while index < arguments.len() {
@@ -7364,6 +7414,15 @@ fn parse_cli(arguments: &[OsString]) -> Result<Option<CliOptions>, String> {
                         inline,
                     )?));
                 }
+                "--continue-after-recorded-timeout" => {
+                    if inline.is_some() {
+                        return Err(
+                            "argument --continue-after-recorded-timeout: ignored explicit argument"
+                                .to_owned(),
+                        );
+                    }
+                    continue_after_recorded_timeout = true;
+                }
                 _ => {
                     return Err(format!(
                         "unrecognized arguments: {}",
@@ -7396,6 +7455,7 @@ fn parse_cli(arguments: &[OsString]) -> Result<Option<CliOptions>, String> {
         pacing,
         timeout_sec,
         action_output_dir,
+        continue_after_recorded_timeout,
     }))
 }
 
@@ -7403,6 +7463,7 @@ fn run_cli(options: CliOptions) -> Result<i32, ReplayError> {
     let mut replay_options = ReplayOptions::new(options.cwd);
     replay_options.pacing = options.pacing;
     replay_options.timeout_sec = options.timeout_sec;
+    replay_options.continue_after_recorded_timeout = options.continue_after_recorded_timeout;
     replay_options.artifacts_dir = Some(
         options
             .output
@@ -7963,6 +8024,7 @@ mod tests {
                 tty: true,
                 artifacts_dir: temporary.path(),
                 action_index: 0,
+                abandon_unkillable: false,
             })
             .unwrap();
             assert_eq!(output.timed_out, timeout);
@@ -8020,8 +8082,8 @@ mod tests {
         .unwrap();
         let mut child = command.spawn().unwrap();
         drop(command);
-        let (status, timed_out) =
-            wait_with_timeout_cleanup(&mut child, Some(Duration::from_secs(3))).unwrap();
+        let (status, timed_out, _) =
+            wait_with_timeout_cleanup(&mut child, Some(Duration::from_secs(3)), false).unwrap();
         assert!(!timed_out);
         assert!(status.success());
         assert_eq!(
@@ -8346,6 +8408,7 @@ mod tests {
                 pacing: Pacing::Unpaced,
                 timeout_sec: None,
                 action_output_dir: None,
+                continue_after_recorded_timeout: false,
             })
             .unwrap(),
             1
@@ -9955,6 +10018,76 @@ mod tests {
             .as_u64()
             .is_some_and(|timestamp| timestamp > 0));
         assert!(!temporary.path().join("must-not-exist").exists());
+    }
+
+    fn mini_swe_timeout_then_touch(source_timed_out: bool, temporary: &Path) -> PathBuf {
+        let first_result = if source_timed_out {
+            json!({"results": [{"content": "{\"returncode\": -1, \"output\": \"\", \"exception_info\": \"An error occurred while executing the command: Command 'sleep 30' timed out after 30 seconds\"}"}]})
+        } else {
+            json!({"results": [{"content": "{\"returncode\": 0}"}]})
+        };
+        write_trajectory(
+            temporary,
+            vec![
+                ("bash", json!({"command": "sleep 30"}), first_result),
+                (
+                    "bash",
+                    json!({"command": "touch ran-after-timeout"}),
+                    json!({"results": [{"content": "{\"returncode\": 0}"}]}),
+                ),
+            ],
+            json!({
+                "name": "mini-swe-agent",
+                "extra": {"original_format": MINI_SWE_AGENT_ORIGINAL_FORMAT},
+            }),
+        )
+    }
+
+    #[test]
+    fn continue_after_recorded_timeout_replays_later_actions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let trajectory =
+            read_trajectory(&mini_swe_timeout_then_touch(true, temporary.path())).unwrap();
+        let mut options = replay_options(temporary.path());
+        options.timeout_sec = Some(0.5);
+        options.continue_after_recorded_timeout = true;
+        let report = replay_trajectory(&trajectory, &options).unwrap();
+        assert_eq!(report["continue_after_recorded_timeout"], true);
+        assert_eq!(report["summary"]["actions_timed_out"], 1);
+        assert_eq!(report["summary"]["actions_skipped_after_timeout"], 0);
+        assert!(report["summary"]["aborted_after_timeout_action_index"].is_null());
+        assert_eq!(report["summary"]["source_outcome_mismatch_count"], 0);
+        assert_eq!(report["actions"][0]["status"], "timed_out");
+        assert_eq!(report["actions"][1]["status"], "ok");
+        assert!(temporary.path().join("ran-after-timeout").exists());
+    }
+
+    #[test]
+    fn continue_after_recorded_timeout_still_stops_on_a_new_timeout() {
+        let temporary = tempfile::tempdir().unwrap();
+        let trajectory =
+            read_trajectory(&mini_swe_timeout_then_touch(false, temporary.path())).unwrap();
+        let mut options = replay_options(temporary.path());
+        options.timeout_sec = Some(0.5);
+        options.continue_after_recorded_timeout = true;
+        let report = replay_trajectory(&trajectory, &options).unwrap();
+        assert_eq!(report["summary"]["actions_timed_out"], 1);
+        assert_eq!(report["summary"]["actions_skipped_after_timeout"], 1);
+        assert_eq!(report["summary"]["aborted_after_timeout_action_index"], 1);
+        assert!(!temporary.path().join("ran-after-timeout").exists());
+    }
+
+    #[test]
+    fn recorded_timeout_still_stops_replay_by_default() {
+        let temporary = tempfile::tempdir().unwrap();
+        let trajectory =
+            read_trajectory(&mini_swe_timeout_then_touch(true, temporary.path())).unwrap();
+        let mut options = replay_options(temporary.path());
+        options.timeout_sec = Some(0.5);
+        let report = replay_trajectory(&trajectory, &options).unwrap();
+        assert_eq!(report["continue_after_recorded_timeout"], false);
+        assert_eq!(report["summary"]["aborted_after_timeout_action_index"], 1);
+        assert!(!temporary.path().join("ran-after-timeout").exists());
     }
 
     #[test]
