@@ -161,6 +161,25 @@ uv run tasktrace-capture \
 
 OpenSandbox requires a prebuilt Linux OCI image. GPU tasks, Docker Compose, forced builds, and Dockerfile build steps such as `RUN` and `COPY` are not currently supported. Sandboxes are automatically cleaned up after each trial.
 
+For a controller behind a private CA, set `TASKTRACE_CAPTURE_OPENSANDBOX_CA_BUNDLE=/path/to/ca.pem`; for a self-signed endpoint, `TASKTRACE_CAPTURE_OPENSANDBOX_TLS_VERIFY=0` disables certificate verification. Neither is set by default.
+
+The OpenSandbox runtime does not install the shell instrumentation that `--instrument-shell-commands` uses with Enroot and Docker, so a trial yields Harbor's ATIF trajectory (`agent/trajectory.json`) but no `tasktrace_capture_replay_trajectory.jsonl`. Three helpers cover the rest of an OpenSandbox capture-and-replay workflow:
+
+```bash
+# Harbor's SWE-bench tasks add uv and /logs with RUN steps; keep the prebuilt image and move those steps.
+uv run tasktrace-opensandbox-task <harbor-task-dir> <out-task-dir> --cpus 4
+
+# After a mini-swe-agent trial: make its ATIF trajectory replayable by tasktrace.
+uv run tasktrace-atif-normalize <trial>/agent/trajectory.json trajectory.json
+
+# Replay it in a fresh sandbox from the same image with `tasktrace profile atif --runtime current`.
+# The tasktrace binary must match the sandbox architecture (e.g. an x86_64 glibc build).
+uv run tasktrace-opensandbox-replay ./tasktrace trajectory.json <task-image> replay-out \
+    --format atif --cpus 4 --memory 4Gi --workdir /testbed --timeout-sec 30 --continue-after-recorded-timeout
+```
+
+`tasktrace-opensandbox-replay` also replays finalized capture traces (`--format trace`, the default), such as the recordings under `inference/trajectories/`. It runs the replay from the sandbox entrypoint so that OpenSandbox's keep-alive process does not invalidate the current-container CPU measurement.
+
 ### Apptainer (Docker-free HPC)
 
 Apptainer is opt-in; Enroot remains the default. Apptainer requires a `.sif` file whose architecture matches the compute node. TaskTrace-capture selects its managed userspace Apptainer automatically, but it does not pull or build the evaluation image.

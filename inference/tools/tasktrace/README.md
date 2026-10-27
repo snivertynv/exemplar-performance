@@ -230,6 +230,12 @@ Claude Code ATIF replay and profiling are not supported in release 26.10.
 Trajectories containing nested Codex exec or Claude Code actions are also rejected.
 Generic ATIF tool calls and the mini-swe-agent wrapper described above remain supported.
 
+By default an ATIF replay stops at the first action that times out. With
+`--continue-after-recorded-timeout` (`tasktrace replay atif` and `tasktrace profile atif`), a timeout on an
+action that also timed out in the recording does not end the replay; a timeout the recording did not have
+still does. Processes that survive SIGKILL in such an action (for example blocked on a network
+filesystem) are left behind and listed as `unkillable_pids_abandoned` on the action.
+
 Recorded shell, login, working-directory, and TTY options are honored. Commands
 use the environment established by the selected image or runtime, including
 profile-level `--env` overrides; per-action ATIF environment maps are not
