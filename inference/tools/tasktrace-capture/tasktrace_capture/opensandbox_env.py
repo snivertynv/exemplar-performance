@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shlex
+import ssl
 import tarfile
 import tempfile
 import uuid
@@ -25,6 +26,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpx
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import (
     EnvironmentCapabilities,
@@ -107,6 +109,32 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _tls_transport() -> httpx.AsyncHTTPTransport | None:
+    """An httpx transport for a controller whose certificate the default trust store rejects.
+
+    ``TASKTRACE_CAPTURE_OPENSANDBOX_CA_BUNDLE`` verifies against a private CA bundle;
+    ``TASKTRACE_CAPTURE_OPENSANDBOX_TLS_VERIFY=0`` disables verification (self-signed endpoints).
+    Neither set keeps the SDK's default transport and verification.
+    """
+    ca_bundle = os.environ.get("TASKTRACE_CAPTURE_OPENSANDBOX_CA_BUNDLE", "").strip()
+    verify_raw = os.environ.get("TASKTRACE_CAPTURE_OPENSANDBOX_TLS_VERIFY", "").strip().lower()
+    if verify_raw not in {"", "1", "true", "yes", "0", "false", "no"}:
+        raise ValueError(f"TASKTRACE_CAPTURE_OPENSANDBOX_TLS_VERIFY must be a boolean, got {verify_raw!r}")
+    verify_off = verify_raw in {"0", "false", "no"}
+    if ca_bundle and verify_off:
+        raise ValueError(
+            "Set either TASKTRACE_CAPTURE_OPENSANDBOX_CA_BUNDLE or "
+            "TASKTRACE_CAPTURE_OPENSANDBOX_TLS_VERIFY=0, not both"
+        )
+    if ca_bundle:
+        if not Path(ca_bundle).is_file():
+            raise ValueError(f"TASKTRACE_CAPTURE_OPENSANDBOX_CA_BUNDLE is not a file: {ca_bundle}")
+        return httpx.AsyncHTTPTransport(verify=ssl.create_default_context(cafile=ca_bundle))
+    if verify_off:
+        return httpx.AsyncHTTPTransport(verify=False)
+    return None
+
+
 def _connection_config() -> ConnectionConfig:
     raw_url = os.environ.get("OPENSANDBOX_URL", "").strip()
     api_key = os.environ.get("OPENSANDBOX_API_KEY", "").strip()
@@ -119,6 +147,7 @@ def _connection_config() -> ConnectionConfig:
         raise ValueError("OPENSANDBOX_URL must be an absolute http:// or https:// URL")
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise ValueError("OPENSANDBOX_URL must not include a path, query, or fragment")
+    transport = _tls_transport()
     return ConnectionConfig(
         domain=parsed.netloc,
         api_key=api_key,
@@ -134,6 +163,7 @@ def _connection_config() -> ConnectionConfig:
             )
         ),
         use_server_proxy=True,
+        **({"transport": transport} if transport is not None else {}),
     )
 
 

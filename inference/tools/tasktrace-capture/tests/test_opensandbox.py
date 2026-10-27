@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
@@ -20,6 +21,7 @@ from tasktrace_capture.opensandbox_env import (
     _add_allowed_hosts,
     _allowed_targets_digest,
     _connection_config,
+    _tls_transport,
     _inference_endpoint_host,
     _network_policy,
     _setup_allowed_hosts,
@@ -142,6 +144,50 @@ def test_connection_config_request_timeout_can_be_overridden(monkeypatch):
     config = _connection_config()
 
     assert config.request_timeout == timedelta(seconds=240)
+
+
+def test_connection_config_keeps_default_tls(monkeypatch):
+    monkeypatch.delenv("TASKTRACE_CAPTURE_OPENSANDBOX_CA_BUNDLE", raising=False)
+    monkeypatch.delenv("TASKTRACE_CAPTURE_OPENSANDBOX_TLS_VERIFY", raising=False)
+    assert _tls_transport() is None
+
+
+def test_connection_config_can_disable_tls_verification(monkeypatch):
+    monkeypatch.setenv("TASKTRACE_CAPTURE_OPENSANDBOX_TLS_VERIFY", "0")
+    transport = _tls_transport()
+    assert transport is not None
+    assert transport._pool._ssl_context.verify_mode == ssl.CERT_NONE
+    assert _connection_config().transport is not None
+
+
+def test_connection_config_accepts_ca_bundle(monkeypatch, tmp_path):
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text(certifi_bundle_text())
+    monkeypatch.setenv("TASKTRACE_CAPTURE_OPENSANDBOX_CA_BUNDLE", str(bundle))
+    transport = _tls_transport()
+    assert transport is not None
+    assert transport._pool._ssl_context.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_connection_config_rejects_conflicting_tls_settings(monkeypatch, tmp_path):
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text(certifi_bundle_text())
+    monkeypatch.setenv("TASKTRACE_CAPTURE_OPENSANDBOX_CA_BUNDLE", str(bundle))
+    monkeypatch.setenv("TASKTRACE_CAPTURE_OPENSANDBOX_TLS_VERIFY", "0")
+    with pytest.raises(ValueError, match="not both"):
+        _tls_transport()
+
+
+def test_connection_config_rejects_missing_ca_bundle(monkeypatch, tmp_path):
+    monkeypatch.setenv("TASKTRACE_CAPTURE_OPENSANDBOX_CA_BUNDLE", str(tmp_path / "missing.pem"))
+    with pytest.raises(ValueError, match="not a file"):
+        _tls_transport()
+
+
+def certifi_bundle_text() -> str:
+    import certifi
+
+    return Path(certifi.where()).read_text()
 
 
 def test_runtime_preflight_requires_controller_credentials(monkeypatch):
