@@ -19,6 +19,9 @@ dependencies = [
 [project.scripts]
 tasktrace-capture = "tasktrace_capture.cli:main"
 tasktrace-capture-plots = "tasktrace_capture.plot_timing:main"
+tasktrace-opensandbox-replay = "tasktrace_capture.opensandbox_replay:main"
+tasktrace-opensandbox-task = "tasktrace_capture.opensandbox_task:main"
+tasktrace-atif-normalize = "tasktrace_capture.atif_normalize:main"
 
 [build-system]
 requires = ["hatchling"]
