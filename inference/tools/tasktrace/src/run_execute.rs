@@ -3163,7 +3163,7 @@ fn current_affinity() -> Result<Vec<u32>, RunExecutionError> {
         )));
     }
     let mut cpus = Vec::new();
-    for cpu in 0..libc::CPU_SETSIZE as usize {
+    for cpu in 0..crate::CPU_SET_CAPACITY {
         if unsafe { libc::CPU_ISSET(cpu, &set) } {
             cpus.push(cpu as u32);
         }
@@ -3183,9 +3183,10 @@ fn mutate_current_thread_affinity(cpu_ids: &[u32]) -> Result<(), RunExecutionErr
     let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
     unsafe { libc::CPU_ZERO(&mut set) };
     for cpu in cpu_ids {
-        if *cpu as usize >= libc::CPU_SETSIZE as usize {
+        if *cpu as usize >= crate::CPU_SET_CAPACITY {
             return Err(RunExecutionError::new(format!(
-                "unable to enforce controller CPU affinity: logical CPU {cpu} exceeds CPU_SETSIZE"
+                "unable to enforce controller CPU affinity: logical CPU {cpu} exceeds the CPU set capacity ({})",
+                crate::CPU_SET_CAPACITY
             )));
         }
         unsafe { libc::CPU_SET(*cpu as usize, &mut set) };
@@ -6222,7 +6223,7 @@ mod tests {
         let result =
             unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
         assert_eq!(result, 0);
-        (0..libc::CPU_SETSIZE as usize)
+        (0..crate::CPU_SET_CAPACITY)
             .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) })
             .map(|cpu| cpu as u32)
             .collect()

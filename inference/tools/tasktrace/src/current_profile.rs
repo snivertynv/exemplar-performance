@@ -559,7 +559,7 @@ fn process_affinity() -> Result<Vec<u32>, CurrentProfileError> {
         )));
     }
     let mut ids = Vec::new();
-    for cpu in 0..libc::CPU_SETSIZE as usize {
+    for cpu in 0..crate::CPU_SET_CAPACITY {
         if unsafe { libc::CPU_ISSET(cpu, &set) } {
             ids.push(cpu as u32);
         }

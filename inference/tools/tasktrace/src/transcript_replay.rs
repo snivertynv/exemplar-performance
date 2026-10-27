@@ -896,7 +896,7 @@ fn scheduler_affinity() -> Result<Vec<u64>, ReplayError> {
         return Err(io::Error::last_os_error().into());
     }
     let mut cpus = Vec::new();
-    for cpu in 0..libc::CPU_SETSIZE as usize {
+    for cpu in 0..crate::CPU_SET_CAPACITY {
         if unsafe { libc::CPU_ISSET(cpu, &set) } {
             cpus.push(cpu as u64);
         }

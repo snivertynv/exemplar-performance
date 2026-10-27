@@ -65,6 +65,12 @@ mod unified_view;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Logical CPUs a `cpu_set_t` can hold: 1024 with both glibc and musl. Iterate affinity masks to
+/// this, not `libc::CPU_SETSIZE`, which musl defines as 128 although its `cpu_set_t` has 1024 bits;
+/// on hosts with more than 128 CPUs a musl build would otherwise miss every CPU from 128 up.
+#[cfg(target_os = "linux")]
+pub(crate) const CPU_SET_CAPACITY: usize = 8 * std::mem::size_of::<libc::cpu_set_t>();
+
 #[derive(Clone, Copy)]
 struct CommandSpec {
     group: &'static str,
@@ -308,6 +314,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_set_capacity_covers_cpus_beyond_musl_cpu_setsize() {
+        assert!(CPU_SET_CAPACITY >= 1024);
+        let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        unsafe { libc::CPU_SET(150, &mut set) };
+        let found: Vec<usize> = (0..CPU_SET_CAPACITY)
+            .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) })
+            .collect();
+        assert_eq!(found, vec![150]);
+    }
 
     #[test]
     fn table_has_unique_public_leaves() {
